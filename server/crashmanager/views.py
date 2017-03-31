@@ -65,6 +65,10 @@ def filter_signatures_by_toolfilter(request, signatures, restricted_only=False):
     if restricted_only and not user.restricted:
         return signatures
 
+    # If the user is unrestricted and all=1 is set, do not apply any filters
+    if not user.restricted and "all" in request.GET and request.GET["all"]:
+        return signatures
+
     defaultToolsFilter = user.defaultToolsFilter.all()
     if defaultToolsFilter:
         return signatures.filter(crashentry__tool__in=defaultToolsFilter).distinct()
@@ -189,7 +193,7 @@ def signatures(request):
 
     # Do not display triaged crash entries unless there is an all=1 parameter
     # specified in the search query. Otherwise only show untriaged entries.
-    if not "all" in request.GET or not request.GET["all"]:
+    if (not "all" in request.GET or not request.GET["all"]) and not isSearch:
         filters["bug"] = None
 
     entries = entries.filter(**filters)
@@ -344,9 +348,6 @@ def editCrashEntry(request, crashid):
         entry.testcase.loadTest()
 
     if request.method == 'POST':
-        # Force the cached crash information to be repopulated
-        entry.cachedCrashInfo = None
-
         entry.rawStdout = request.POST['rawStdout']
         entry.rawStderr = request.POST['rawStderr']
         entry.rawStderr = request.POST['rawStderr']
@@ -357,10 +358,8 @@ def editCrashEntry(request, crashid):
         entry.metadataList = request.POST['metadata'].splitlines()
 
         # Regenerate crash information and fields depending on it
+        entry.reparseCrashInfo(save=False)
         crashInfo = entry.getCrashInfo()
-        if crashInfo.crashAddress != None:
-            entry.crashAddress = hex(crashInfo.crashAddress)
-        entry.shortSignature = crashInfo.createShortSignature()
 
         if entry.testcase:
             if entry.testcase.isBinary:
@@ -681,13 +680,17 @@ def optimizeSignature(request, sigid):
     buckets = Bucket.objects.all()
 
     # Get all unbucketed entries for that user, respecting the tools filter though
-    entries = CrashEntry.objects.filter(bucket=None).order_by('-id')
+    entries = CrashEntry.objects.filter(bucket=None).order_by('-id').prefetch_related("platform", "product", "os")
     entries = filter_crash_entries_by_toolfilter(request, entries)
 
     signature = bucket.getSignature()
 
     optimizedSignature = None
     matchingEntries = []
+
+    # Avoid hitting the database multiple times when looking for the first
+    # entry of a bucket. Keeping these in memory is less expensive.
+    firstEntryPerBucketCache = {}
 
     for entry in entries:
         entry.crashinfo = entry.getCrashInfo(attachTestcase=signature.matchRequiresTest())
@@ -709,12 +712,17 @@ def optimizeSignature(request, sigid):
                 if otherBucket.pk == bucket.pk:
                     continue
 
-                bucketEntries = CrashEntry.objects.filter(bucket=otherBucket)
-                firstEntry = list(bucketEntries[:1])
-                if firstEntry:
-                    firstEntry = firstEntry[0]
+                if not otherBucket.pk in firstEntryPerBucketCache:
+                    c = CrashEntry.objects.filter(bucket=otherBucket).first()
+                    firstEntryPerBucketCache[otherBucket.pk] = c
+                    if c:
+                        # Omit testcase for performance reasons for now
+                        firstEntryPerBucketCache[otherBucket.pk] = c.getCrashInfo(attachTestcase=False)
+
+                firstEntryCrashInfo = firstEntryPerBucketCache[otherBucket.pk]
+                if firstEntryCrashInfo:
                     # Omit testcase for performance reasons for now
-                    if optimizedSignature.matches(firstEntry.getCrashInfo(attachTestcase=False)):
+                    if optimizedSignature.matches(firstEntryCrashInfo):
                         matchesInOtherBuckets = True
                         break
 
@@ -751,6 +759,10 @@ def findSignatures(request, crashid):
     similarBuckets = []
     matchingBucket = None
 
+    # Avoid hitting the database multiple times when looking for the first
+    # entry of a bucket. Keeping these in memory is less expensive.
+    firstEntryPerBucketCache = {}
+
     for bucket in buckets:
         signature = bucket.getSignature()
         distance = signature.getDistance(entry.crashinfo)
@@ -775,12 +787,17 @@ def findSignatures(request, crashid):
                     if otherBucket.pk == bucket.pk:
                         continue
 
-                    bucketEntries = CrashEntry.objects.filter(bucket=otherBucket)
-                    firstEntry = list(bucketEntries[:1])
-                    if firstEntry:
-                        firstEntry = firstEntry[0]
+                    if not otherBucket.pk in firstEntryPerBucketCache:
+                        c = CrashEntry.objects.filter(bucket=otherBucket).first()
+                        firstEntryPerBucketCache[otherBucket.pk] = c
+                        if c:
+                            # Omit testcase for performance reasons for now
+                            firstEntryPerBucketCache[otherBucket.pk] = c.getCrashInfo(attachTestcase=False)
+
+                    firstEntryCrashInfo = firstEntryPerBucketCache[otherBucket.pk]
+                    if firstEntryCrashInfo:
                         # Omit testcase for performance reasons for now
-                        if proposedCrashSignature.matches(firstEntry.getCrashInfo(attachTestcase=False)):
+                        if proposedCrashSignature.matches(firstEntryCrashInfo):
                             matchesInOtherBuckets += 1
                             otherMatchingBucketIds.append(otherBucket.pk)
 

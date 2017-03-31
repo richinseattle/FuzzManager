@@ -168,7 +168,7 @@ class CrashInfo():
         gdbString = " received signal SIG"
         gdbCoreString = "Program terminated with signal "
         ubsanString = "SUMMARY: AddressSanitizer: undefined-behavior"
-        appleString = "OS Version:            Mac OS X"
+        appleString = "Mac OS X"
         cdbString = "Microsoft (R) Windows Debugger"
 
         # Use two strings for detecting Minidumps to avoid false positives
@@ -474,19 +474,16 @@ class ASanCrashInfo(CrashInfo):
         else:
             asanOutput = stderr
 
-        # For better readability, list all the formats here, then join them into the regular expression
-        asanMessages = [
-            "on address",  # The most common format, used for all overflows
-            "on unknown address",  # Used in case of a SIGSEGV
-            "double-free on",  # Used in case of a double-free
-            "not malloc\\(\\)\\-ed:",  # Used in case of a wild free (on unallocated memory)
-            "not owned:"  # Used when calling __asan_get_allocated_size() on a pointer that isn't owned
-        ]
-
-        # TODO: Support "memory ranges [%p,%p) and [%p, %p) overlap" ?
-
-        asanCrashAddressPattern = " AddressSanitizer:.+ (?:" + "|".join(asanMessages) + ")\\s+0x([0-9a-f]+)"
-        asanRegisterPattern = "(?:\\s+|\\()pc\\s+0x([0-9a-f]+)\\s+(sp|bp)\\s+0x([0-9a-f]+)\\s+(sp|bp)\\s+0x([0-9a-f]+)"
+        asanCrashAddressPattern = r"""(?x)
+                                   \sAddressSanitizer:.*\s
+                                     (?:on\saddress             # The most common format, used for all overflows
+                                       |on\sunknown\saddress    # Used in case of a SIGSEGV
+                                       |double-free\son         # Used in case of a double-free
+                                       |not\smalloc\(\)-ed:     # Used in case of a wild free (on unallocated memory)
+                                       |not\sowned:             # Used when calling __asan_get_allocated_size() on a pointer that isn't owned
+                                       |memcpy-param-overlap:\smemory\sranges\s\[) # Bad memcpy
+                                   \s*0x([0-9a-f]+)"""
+        asanRegisterPattern = r"(?:\s+|\()pc\s+0x([0-9a-f]+)\s+(sp|bp)\s+0x([0-9a-f]+)\s+(sp|bp)\s+0x([0-9a-f]+)"
 
         expectedIndex = 0
         for traceLine in asanOutput:
@@ -505,7 +502,7 @@ class ASanCrashInfo(CrashInfo):
                     else:
                         # We might be dealing with one of the few ASan traces that don't emit registers
                         pass
-                continue # Not in the ASan output yet. Some lines in eg. debug+asan builds might error if we continue.
+                continue  # Not in the ASan output yet. Some lines in eg. debug+asan builds might error if we continue.
 
             parts = traceLine.strip().split()
 
@@ -583,6 +580,7 @@ class ASanCrashInfo(CrashInfo):
             # Strip various forms of special thread information and messages
             asanMsg = re.sub(" in thread T.+", "", asanMsg)
             asanMsg = re.sub(" malloc\(\)\-ed: 0x[0-9a-f]+", r" malloc()-ed", asanMsg)
+            asanMsg = re.sub(r"\[0x[0-9a-f]+,0x[0-9a-f]+\) and \[0x[0-9a-f]+, 0x[0-9a-f]+\) overlap", "overlap", asanMsg)
 
             if len(self.backtrace):
                 asanMsg += " [@ %s]" % self.backtrace[0]
@@ -710,7 +708,8 @@ class GDBCrashInfo(CrashInfo):
 
         gdbFramePatterns = [
             "\\s*#(\\d+)\\s+(0x[0-9a-f]+) in (.+?) \\(.*?\\)( at .+)?",
-            "\\s*#(\\d+)\\s+()(.+?) \\(.*?\\)( at .+)?"
+            "\\s*#(\\d+)\\s+()(.+?) \\(.*?\\)( at .+)?",
+            "\\s*#(\\d+)\\s+()(<signal handler called>)"
         ]
 
         gdbRegisterPattern = RegisterHelper.getRegisterPattern() + "\\s+0x([0-9a-f]+)"
@@ -746,6 +745,12 @@ class GDBCrashInfo(CrashInfo):
                         match = re.search(gdbCrashInstructionPattern, traceLine)
                         if match != None:
                             self.crashInstruction = match.group(1)
+
+                            # In certain cases, the crash instruction can have
+                            # trailing function information, strip it here.
+                            match = re.search("(\\s+<.+>\\s*)$", self.crashInstruction)
+                            if match != None:
+                                self.crashInstruction = self.crashInstruction.replace(match.group(1), "")
 
             if not pastFrames:
                 if not len(lastLineBuf) and re.match("\\s*#\\d+.+", traceLine) == None:
@@ -873,19 +878,55 @@ class GDBCrashInfo(CrashInfo):
         # When we fail, try storing a reason here
         failureReason = "Unknown failure."
 
+        def isDerefOp(op):
+            return "(" in op and ")" in op
+
+        def calculateDerefOpAddress(derefOp):
+            match = re.match("((?:\\-?0x[0-9a-f]+)?)\\(%([a-z0-9]+)\\)", derefOp)
+            if match != None:
+                offset = 0L
+                if len(match.group(1)):
+                    offset = long(match.group(1), 16)
+
+                val = RegisterHelper.getRegisterValue(match.group(2), registerMap)
+
+                # If we don't have the value, return None
+                if val == None:
+                    return (None, "Missing value for register %s " % match.group(2))
+                else:
+                    if RegisterHelper.getBitWidth(registerMap) == 32:
+                        return (long(int32(uint32(offset)) + int32(uint32(val))), None)
+                    else:
+                        # Assume 64 bit width
+                        return (long(int64(uint64(offset)) + int64(uint64(val))), None)
+            else:
+                return (None, "Failed to match dereference operation.")
+
         if RegisterHelper.isX86Compatible(registerMap):
             if len(parts) == 1:
-                if instruction == "callq" or instruction == "push" or instruction == "pop":
+                if re.match("callq?$", instruction) or re.match("(push|pop)(l|w|q)?$", instruction):
                     return RegisterHelper.getStackPointer(registerMap)
                 else:
+                    if isDerefOp(parts[0]):
+                        # Single operand instruction with a memory dereference
+                        # We list supported ones explicitly to make sure that
+                        # we don't mix them with instructions that also
+                        # interacts with the stack pointer.
+                        if instruction.startswith("set"):
+                            (val, failed) = calculateDerefOpAddress(parts[0])
+                            if failed:
+                                failureReason = failed
+                            else:
+                                return val
+
                     failureReason = "Unsupported single-operand instruction."
             elif len(parts) == 2:
                 failureReason = "Unknown failure with two-operand instruction."
                 derefOp = None
-                if "(" in parts[0] and ")" in parts[0]:
+                if isDerefOp(parts[0]):
                     derefOp = parts[0]
 
-                if "(" in parts[1] and ")" in parts[1]:
+                if isDerefOp(parts[1]):
                     if derefOp != None:
                         if ":(" in parts[1]:
                             # This can be an instruction using multiple segments, like:
@@ -915,23 +956,11 @@ class GDBCrashInfo(CrashInfo):
                     derefOp = parts[1]
 
                 if derefOp != None:
-                    match = re.match("((?:\\-?0x[0-9a-f]+)?)\\(%([a-z0-9]+)\\)", derefOp)
-                    if match != None:
-                        offset = 0L
-                        if len(match.group(1)):
-                            offset = long(match.group(1), 16)
-
-                        val = RegisterHelper.getRegisterValue(match.group(2), registerMap)
-
-                        # If we don't have the value, return None
-                        if val == None:
-                            failureReason = "Missing value for register %s " % match.group(2)
+                        (val, failed) = calculateDerefOpAddress(derefOp)
+                        if failed:
+                            failureReason = failed
                         else:
-                            if RegisterHelper.getBitWidth(registerMap) == 32:
-                                return long(int32(uint32(offset)) + int32(uint32(val)))
-                            else:
-                                # Assume 64 bit width
-                                return long(int64(uint64(offset)) + int64(uint64(val)))
+                            return val
                 else:
                     failureReason = "Failed to decode two-operand instruction: No dereference operation or hardcoded address detected."
                     # We might still be reading from/writing to a hardcoded address.
@@ -1125,22 +1154,25 @@ class CDBCrashInfo(CrashInfo):
         '''
         CrashInfo.__init__(self)
 
-        if stdout != None:
+        if stdout is not None:
             self.rawStdout.extend(stdout)
 
-        if stderr != None:
+        if stderr is not None:
             self.rawStderr.extend(stderr)
 
-        if crashData != None:
+        if crashData is not None:
             self.rawCrashData.extend(crashData)
 
         self.configuration = configuration
 
         cdbRegisterPattern = RegisterHelper.getRegisterPattern() + "=([0-9a-f]+)"
 
+        address = ""
         inCrashingThread = False
+        inCrashInstruction = False
         inEcxrData = False
         ecxrData = []
+        cInstruction = ""
 
         for line in crashData:
             # Start of .ecxr data
@@ -1149,78 +1181,110 @@ class CDBCrashInfo(CrashInfo):
                 continue
 
             if inEcxrData:
-                # Example:
+                # 32-bit example:
                 #     0:000> .ecxr
-                #     rax=0000000000000000 rbx=0000000000008000 rcx=00000000000005af
-                #     rdx=0000000000000000 rsi=0000000008c52000 rdi=0000000000008000
-                #     rip=000007fef86c13e4 rsp=000000000033bb10 rbp=0000000000000008
-                #      r8=0000000077440000  r9=00000000000003a6 r10=00000000c000012d
-                #     r11=0000000000000246 r12=0000000000000008 r13=0000000000500040
-                #     r14=0000000008c007e0 r15=0000000000000000
+                #     eax=02efff01 ebx=016fddb8 ecx=2b2b2b2b edx=016fe490 esi=02e00310 edi=02e00310
+                #     eip=00404c59 esp=016fdc2c ebp=016fddb8 iopl=0         nv up ei pl nz na po nc
+                #     cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010202
+                # 64-bit example:
+                #     0:000> .ecxr
+                #     rax=00007ff74d8fee30 rbx=00000285ef400420 rcx=2b2b2b2b2b2b2b2b
+                #     rdx=00000285ef21b940 rsi=000000e87fbfc340 rdi=00000285ef400420
+                #     rip=00007ff74d469ff3 rsp=000000e87fbfc040 rbp=fffe000000000000
+                #      r8=000000e87fbfc140  r9=000000000001fffc r10=0000000000000649
+                #     r11=00000285ef25a000 r12=00007ff74d9239a0 r13=fffa7fffffffffff
+                #     r14=000000e87fbfd0e0 r15=0000000000000003
                 #     iopl=0         nv up ei pl nz na pe nc
-                #     cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000200
+                #     cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010200
                 if line.startswith("cs="):
                     inEcxrData = False
                     continue
 
-                # First extract the line, example:
-                #     rax=0000000000000000 rbx=0000000000008000 rcx=00000000000005af
+                # Crash address
+                # Extract the eip/rip specifically for use later
+                if "eip=" in line:
+                    address = line.split("eip=")[1].split()[0]
+                    self.crashAddress = long(address, 16)
+                elif "rip=" in line:
+                    address = line.split("rip=")[1].split()[0]
+                    self.crashAddress = long(address, 16)
+
+                # First extract the line
+                # 32-bit example:
+                #     eax=02efff01 ebx=016fddb8 ecx=2b2b2b2b edx=016fe490 esi=02e00310 edi=02e00310
+                # 64-bit example:
+                #     rax=00007ff74d8fee30 rbx=00000285ef400420 rcx=2b2b2b2b2b2b2b2b
                 matchLine = re.search(RegisterHelper.getRegisterPattern(), line)
-                if matchLine != None:
+                if matchLine is not None:
                     ecxrData.extend(line.split())
 
-                # Next, put the rax, rbx, rcx, etc. entries into a list of their own, then iterate
+                # Next, put the eax/rax, ebx/rbx, etc. entries into a list of their own, then iterate
                 match = re.search(cdbRegisterPattern, line)
                 for instr in ecxrData:
                     match = re.search(cdbRegisterPattern, instr)
-                    if match != None:
+                    if match is not None:
                         register = match.group(1)
                         value = long(match.group(2), 16)
                         self.registers[register] = value
 
-            # Crash address
-            if line.startswith("Exception Faulting Address:"):
-                # Example:
-                #     Exception Faulting Address: 0x7fef86c13e4
-                address = line.split(": ")[1]
-                self.crashAddress = long(address, 16)
-
             # Crash instruction
-            if line.startswith("Faulting Instruction:"):
-                # Example:
-                #     Faulting Instruction:01206fbd int 3
-                cInstruction = line.split(":")[1].split(None, 1)[1]
-                self.crashInstruction = cInstruction
+            # Start of crash instruction details
+            if line.startswith("FAULTING_IP"):
+                inCrashInstruction = True
+                continue
+
+            if inCrashInstruction and not cInstruction:
+                if "PROCESS_NAME" in line:
+                    inCrashInstruction = False
+                    continue
+
+                # 64-bit binaries have a backtick in their addresses, e.g. 00007ff7`1e424e62
+                lineWithoutBacktick = line.replace("`", "", 1)
+                if address and lineWithoutBacktick.startswith(address):
+                    # 32-bit examples:
+                    #     25d80b01 cc              int     3
+                    #     00404c59 8b39            mov     edi,dword ptr [ecx]
+                    # 64-bit example:
+                    #     00007ff7`4d469ff3 4c8b01          mov     r8,qword ptr [rcx]
+                    cInstruction = line.split(None, 2)[-1]
+                    # There may be multiple spaces inside the faulting instruction
+                    cInstruction = " ".join(cInstruction.split())
+                    self.crashInstruction = cInstruction
 
             # Start of stack for crashing thread
-            if re.match(r'^\s*Hash Usage : Stack Trace:', line):
+            if line.startswith("STACK_TEXT:"):
                 inCrashingThread = True
                 continue
 
             if inCrashingThread:
-                # Example:
-                #     Major+Minor : mozglue!moz_abort+0x4
-                #     Minor       : mozglue!je_realloc+0x3d
-                #     Minor       : js_64_prof_windows_a523d4c7efe2!mozilla::VectorBase<unsigned char,256,js::SystemAllocPolicy,mozilla::Vector<unsigned char,256,j+0x53
-                #     Minor       : js_64_prof_windows_a523d4c7efe2!js::jit::X86Encoding::BaseAssembler::X86InstructionFormatter::oneByteOp64+0x35
-                #     Minor       : Unknown
-                components = line.split(None, 4)
-                stackEntry = components[2]
-                # See http://msecdbg.codeplex.com/SourceControl/latest#MSECDbgExts/Source/exploitable.cpp
-                # "Instruction Address: ..." will appear after:  LogStackInformation( objDebugger, objState );
-                if "Instruction" in components[0]:
+                # 32-bit example:
+                #     016fdc38 004b2387 01e104e8 016fe490 016fe490 js_32_dm_windows_62f79d676e0e!JSObject::allocKindForTenure+0x9
+                # 64-bit example:
+                #     000000e8`7fbfc040 00007ff7`4d53a984 : 000000e8`7fbfc2c0 00000285`ef7bb400 00000285`ef21b000 00007ff7`4d4254b9 : js_64_dm_windows_62f79d676e0e!JSObject::allocKindForTenure+0x13
+                if "STACK_COMMAND" in line or "SYMBOL_NAME" in line \
+                        or "THREAD_SHA1_HASH_MOD_FUNC" in line or "FAULTING_SOURCE_CODE" in line:
                     inCrashingThread = False
                     continue
-                stackEntry = CDBCrashInfo.removeFilenameAndOffset(stackEntry)
+
+                # Ignore cdb error and empty lines
+                if "Following frames may be wrong." in line or line.strip() == '':
+                    continue
+
+                stackEntry = CDBCrashInfo.removeFilenameAndOffset(line)
                 stackEntry = CrashInfo.sanitizeStackFrame(stackEntry)
                 self.backtrace.append(stackEntry)
 
     @staticmethod
     def removeFilenameAndOffset(stackEntry):
-        # Uses !exploitable output, sometimes only !exploitable is able to extract function names
-        # Extract only the function name between "!" and "+", and also strip out "<" onwards, if any
-        if "!" in stackEntry:
-            result = stackEntry.split("!")[1].split("+")[0].split("<")[0]
+        # Extract only the function name
+        if "0x" in stackEntry:
+            result = stackEntry.split("!")[-1].split("+")[0].split("<")[0].split(" ")[-1]
+            if "0x" in result:
+                result = "??"  # Sometimes there is only a memory address in the stack
+            elif ".exe" in result:
+                # Sometimes the binary name is present:
+                #     e.g.: "00000000 00000000 unknown!js-dbg-32-prof-dm-windows-42c95d88aaaa.exe+0x0"
+                result = "??"
         else:
             result = "??"
         return result

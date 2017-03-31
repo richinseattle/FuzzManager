@@ -104,44 +104,44 @@ class Collector():
             configInstance = ConfigurationFiles([ globalConfigFile ])
             globalConfig = configInstance.mainConfig
 
-            if self.sigCacheDir == None and "sigdir" in globalConfig:
+            if self.sigCacheDir is None and "sigdir" in globalConfig:
                 self.sigCacheDir = globalConfig["sigdir"]
 
-            if self.serverHost == None and "serverhost" in globalConfig:
+            if self.serverHost is None and "serverhost" in globalConfig:
                 self.serverHost = globalConfig["serverhost"]
 
-            if self.serverPort == None and "serverport" in globalConfig:
-                self.serverPort = globalConfig["serverport"]
+            if self.serverPort is None and "serverport" in globalConfig:
+                self.serverPort = int(globalConfig["serverport"])
 
-            if self.serverProtocol == None and "serverproto" in globalConfig:
+            if self.serverProtocol is None and "serverproto" in globalConfig:
                 self.serverProtocol = globalConfig["serverproto"]
 
-            if self.serverAuthToken == None:
+            if self.serverAuthToken is None:
                 if "serverauthtoken" in globalConfig:
                     self.serverAuthToken = globalConfig["serverauthtoken"]
                 elif "serverauthtokenfile" in globalConfig:
                     with open(globalConfig["serverauthtokenfile"]) as f:
                         self.serverAuthToken = f.read().rstrip()
 
-            if self.clientId == None and "clientid" in globalConfig:
+            if self.clientId is None and "clientid" in globalConfig:
                 self.clientId = globalConfig["clientid"]
 
-            if self.tool == None and "tool" in globalConfig:
+            if self.tool is None and "tool" in globalConfig:
                 self.tool = globalConfig["tool"]
 
         # Set some defaults that we can't set through default arguments, otherwise
         # they would overwrite configuration file settings
-        if self.serverProtocol == None:
+        if self.serverProtocol is None:
             self.serverProtocol = "https"
 
         # Try to be somewhat intelligent about the default port, depending on protocol
-        if self.serverPort == None:
+        if self.serverPort is None:
             if self.serverProtocol == "https":
                 self.serverPort = 433
             else:
                 self.serverPort = 80
 
-        if self.serverHost != None and self.clientId == None:
+        if self.serverHost is not None and self.clientId is None:
             self.clientId = platform.node()
 
     @remote_checks
@@ -151,7 +151,7 @@ class Collector():
         Refresh signatures by contacting the server, downloading new signatures
         and invalidating old ones.
         '''
-        url = "%s://%s:%s/crashmanager/files/signatures.zip" % (self.serverProtocol, self.serverHost, self.serverPort)
+        url = "%s://%s:%d/crashmanager/files/signatures.zip" % (self.serverProtocol, self.serverHost, self.serverPort)
 
         # We need to use basic authentication here because these files are directly served by the HTTP server
         response = requests.get(url, stream=True, auth=('fuzzmanager', self.serverAuthToken))
@@ -178,7 +178,7 @@ class Collector():
         you probably want to use refresh() instead.)
         '''
         with ZipFile(zipFileName, "r") as zipFile:
-            if zipFile.testzip() != None:
+            if zipFile.testzip():
                 raise RuntimeError("Bad CRC for downloaded zipfile %s" % zipFileName)
 
             # Now clean the signature directory, only deleting signatures and metadata
@@ -210,7 +210,7 @@ class Collector():
                          will be stored on the server in JSON format. This metadata is combined
                          with possible metadata stored in the L{ProgramConfiguration} inside crashInfo.
         '''
-        url = "%s://%s:%s/crashmanager/rest/crashes/" % (self.serverProtocol, self.serverHost, self.serverPort)
+        url = "%s://%s:%d/crashmanager/rest/crashes/" % (self.serverProtocol, self.serverHost, self.serverPort)
 
         # Serialize our crash information, testcase and metadata into a dictionary to POST
         data = {}
@@ -228,7 +228,7 @@ class Collector():
             data["testcase"] = testCaseData
             data["testcase_isbinary"] = isBinary
             data["testcase_quality"] = testCaseQuality
-            data["testcase_ext"] = os.path.splitext(testCase)[1][1:]
+            data["testcase_ext"] = os.path.splitext(testCase)[1].lstrip(".")
 
         data["platform"] = crashInfo.configuration.platform
         data["product"] = crashInfo.configuration.product
@@ -258,7 +258,7 @@ class Collector():
             data["args"] = json.dumps(crashInfo.configuration.args)
 
         current_timeout = 2
-        while (True):
+        while True:
             response = requests.post(url, data, headers=dict(Authorization="Token %s" % self.serverAuthToken))
 
             if response.status_code != requests.codes["created"]:
@@ -351,32 +351,32 @@ class Collector():
         if not self.serverHost:
             raise RuntimeError("Must specify serverHost to use remote features.")
 
-        url = "%s://%s:%s/crashmanager/rest/crashes/%s/" % (self.serverProtocol, self.serverHost, self.serverPort, crashId)
+        url = "%s://%s:%d/crashmanager/rest/crashes/%s/" % (self.serverProtocol, self.serverHost, self.serverPort, crashId)
 
         response = requests.get(url, headers=dict(Authorization="Token %s" % self.serverAuthToken))
 
         if response.status_code != requests.codes["ok"]:
             raise self.__serverError(response)
 
-        json = response.json()
+        respJson = response.json()
 
-        if not isinstance(json, dict):
-            raise RuntimeError("Server sent malformed JSON response: %s" % json)
+        if not isinstance(respJson, dict):
+            raise RuntimeError("Server sent malformed JSON response: %s" % respJson)
 
-        if not json["testcase"]:
+        if not respJson["testcase"]:
             return None
 
-        url = "%s://%s:%s/crashmanager/%s" % (self.serverProtocol, self.serverHost, self.serverPort, json["testcase"])
+        url = "%s://%s:%d/crashmanager/%s" % (self.serverProtocol, self.serverHost, self.serverPort, respJson["testcase"])
         response = requests.get(url, auth=('fuzzmanager', self.serverAuthToken))
 
         if response.status_code != requests.codes["ok"]:
             raise self.__serverError(response)
 
-        localFile = os.path.basename(json["testcase"])
+        localFile = os.path.basename(respJson["testcase"])
         with open(localFile, 'w') as f:
             f.write(response.content)
 
-        return (localFile, json)
+        return (localFile, respJson)
 
     def __store_signature_hashed(self, signature):
         '''
@@ -422,85 +422,60 @@ class Collector():
 
             return (testCaseData, isBinary(testCaseData))
 
-def main(argv=None):
+def main():
     '''Command line options.'''
-
-    program_name = os.path.basename(sys.argv[0])
-    program_version = "v%s" % __version__
-    program_build_date = "%s" % __updated__
-
-    program_version_string = '%%prog %s (%s)' % (program_version, program_build_date)
-
-    if argv is None:
-        argv = sys.argv[1:]
 
     # setup argparser
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--version', action='version', version=program_version_string)
+    parser.add_argument('--version', action='version', version='%s v%s (%s)' % (__file__, __version__, __updated__))
 
     # Crash information
-    parser.add_argument("--stdout", dest="stdout", help="File containing STDOUT data", metavar="FILE")
-    parser.add_argument("--stderr", dest="stderr", help="File containing STDERR data", metavar="FILE")
-    parser.add_argument("--crashdata", dest="crashdata", help="File containing external crash data", metavar="FILE")
+    parser.add_argument("--stdout", help="File containing STDOUT data", metavar="FILE")
+    parser.add_argument("--stderr", help="File containing STDERR data", metavar="FILE")
+    parser.add_argument("--crashdata", help="File containing external crash data", metavar="FILE")
 
     # Actions
-    parser.add_argument("--refresh", dest="refresh", action='store_true', help="Perform a signature refresh")
-    parser.add_argument("--submit", dest="submit", action='store_true', help="Submit a signature to the server")
-    parser.add_argument("--search", dest="search", action='store_true', help="Search cached signatures for the given crash")
-    parser.add_argument("--generate", dest="generate", action='store_true', help="Create a (temporary) local signature in the cache directory")
-    parser.add_argument("--autosubmit", dest="autosubmit", action='store_true', help="Go into auto-submit mode. In this mode, all remaining arguments are interpreted as the crashing command. This tool will automatically obtain GDB crash information and submit it.")
-    parser.add_argument("--download", dest="download", type=int, help="Download the testcase for the specified crash entry", metavar="ID")
-    parser.add_argument("--get-clientid", dest="getclientid", action='store_true', help="Print the client ID used when submitting issues")
+    action_group = parser.add_argument_group("Actions", "A single action must be selected.")
+    actions = action_group.add_mutually_exclusive_group(required=True)
+    actions.add_argument("--refresh", action='store_true', help="Perform a signature refresh")
+    actions.add_argument("--submit", action='store_true', help="Submit a signature to the server")
+    actions.add_argument("--search", action='store_true', help="Search cached signatures for the given crash")
+    actions.add_argument("--generate", action='store_true', help="Create a (temporary) local signature in the cache directory")
+    actions.add_argument("--autosubmit", action='store_true', help="Go into auto-submit mode. In this mode, all remaining arguments are interpreted as the crashing command. This tool will automatically obtain GDB crash information and submit it.")
+    actions.add_argument("--download", type=int, help="Download the testcase for the specified crash entry", metavar="ID")
+    actions.add_argument("--get-clientid", action='store_true', help="Print the client ID used when submitting issues")
 
     # Settings
-    parser.add_argument("--sigdir", dest="sigdir", help="Signature cache directory", metavar="DIR")
-    parser.add_argument("--serverhost", dest="serverhost", help="Server hostname for remote signature management", metavar="HOST")
-    parser.add_argument("--serverport", dest="serverport", type=int, help="Server port to use", metavar="PORT")
-    parser.add_argument("--serverproto", dest="serverproto", help="Server protocol to use (default is https)", metavar="PROTO")
-    parser.add_argument("--serverauthtokenfile", dest="serverauthtokenfile", help="File containing the server authentication token", metavar="FILE")
-    parser.add_argument("--clientid", dest="clientid", help="Client ID to use when submitting issues", metavar="ID")
-    parser.add_argument("--platform", dest="platform", help="Platform this crash appeared on", metavar="(x86|x86-64|arm)")
-    parser.add_argument("--product", dest="product", help="Product this crash appeared on", metavar="PRODUCT")
+    parser.add_argument("--sigdir", help="Signature cache directory", metavar="DIR")
+    parser.add_argument("--serverhost", help="Server hostname for remote signature management", metavar="HOST")
+    parser.add_argument("--serverport", type=int, help="Server port to use", metavar="PORT")
+    parser.add_argument("--serverproto", help="Server protocol to use (default is https)", metavar="PROTO")
+    parser.add_argument("--serverauthtokenfile", help="File containing the server authentication token", metavar="FILE")
+    parser.add_argument("--clientid", help="Client ID to use when submitting issues", metavar="ID")
+    parser.add_argument("--platform", help="Platform this crash appeared on", metavar="(x86|x86-64|arm)")
+    parser.add_argument("--product", help="Product this crash appeared on", metavar="PRODUCT")
     parser.add_argument("--productversion", dest="product_version", help="Product version this crash appeared on", metavar="VERSION")
-    parser.add_argument("--os", dest="os", help="OS this crash appeared on", metavar="(windows|linux|macosx|b2g|android)")
-    parser.add_argument("--tool", dest="tool", help="Name of the tool that found this issue", metavar="NAME")
-    parser.add_argument('--args', dest='args', nargs='+', type=str, help="List of program arguments. Backslashes can be used for escaping and are stripped.")
-    parser.add_argument('--env', dest='env', nargs='+', type=str, help="List of environment variables in the form 'KEY=VALUE'")
-    parser.add_argument('--metadata', dest='metadata', nargs='+', type=str, help="List of metadata variables in the form 'KEY=VALUE'")
-    parser.add_argument("--binary", dest="binary", help="Binary that has a configuration file for reading", metavar="BINARY")
+    parser.add_argument("--os", help="OS this crash appeared on", metavar="(windows|linux|macosx|b2g|android)")
+    parser.add_argument("--tool", help="Name of the tool that found this issue", metavar="NAME")
+    parser.add_argument('--args', nargs='+', type=str, help="List of program arguments. Backslashes can be used for escaping and are stripped.")
+    parser.add_argument('--env', nargs='+', type=str, help="List of environment variables in the form 'KEY=VALUE'")
+    parser.add_argument('--metadata', nargs='+', type=str, help="List of metadata variables in the form 'KEY=VALUE'")
+    parser.add_argument("--binary", help="Binary that has a configuration file for reading", metavar="BINARY")
 
 
-    parser.add_argument("--testcase", dest="testcase", help="File containing testcase", metavar="FILE")
-    parser.add_argument("--testcasequality", dest="testcasequality", default="0", help="Integer indicating test case quality (0 is best and default)", metavar="VAL")
+    parser.add_argument("--testcase", help="File containing testcase", metavar="FILE")
+    parser.add_argument("--testcasequality", default=0, type=int, help="Integer indicating test case quality (%(default)s is best and default)", metavar="VAL")
 
     # Options that affect how signatures are generated
-    parser.add_argument("--forcecrashaddr", dest="forcecrashaddr", action='store_true', help="Force including the crash address into the signature")
-    parser.add_argument("--forcecrashinst", dest="forcecrashinst", action='store_true', help="Force including the crash instruction into the signature (GDB only)")
-    parser.add_argument("--numframes", dest="numframes", default=8, type=int, help="How many frames to include into the signature (default is 8)")
+    parser.add_argument("--forcecrashaddr", action='store_true', help="Force including the crash address into the signature")
+    parser.add_argument("--forcecrashinst", action='store_true', help="Force including the crash instruction into the signature (GDB only)")
+    parser.add_argument("--numframes", default=8, type=int, help="How many frames to include into the signature (default: %(default)s)")
 
     parser.add_argument('rargs', nargs=argparse.REMAINDER)
 
-    if len(argv) == 0:
-        parser.print_help()
-        return 2
-
     # process options
-    opts = parser.parse_args(argv)
-
-    # Check that one action is specified
-    actions = [ "refresh", "submit", "search", "generate", "autosubmit", "download", "getclientid" ]
-
-    haveAction = False
-    for action in actions:
-        if getattr(opts, action):
-            if haveAction:
-                print("Error: Cannot specify multiple actions at the same time", file=sys.stderr)
-                return 2
-            haveAction = True
-    if not haveAction:
-        print("Error: Must specify an action", file=sys.stderr)
-        return 2
+    opts = parser.parse_args()
 
     # In autosubmit mode, we try to open a configuration file for the binary specified
     # on the command line. It should contain the binary-specific settings for submitting.
@@ -517,7 +492,7 @@ def main(argv=None):
         # (the testcase), if it hasn't been explicitely specified.
         testcase = opts.testcase
         testcaseidx = None
-        if testcase == None:
+        if testcase is None:
             for idx, arg in enumerate(opts.rargs[1:]):
                 if os.path.exists(arg):
                     if testcase:
@@ -529,8 +504,8 @@ def main(argv=None):
     # Either --autosubmit was specified, or someone specified --binary manually
     # Check that the binary actually exists
     if opts.binary and not os.path.exists(opts.binary):
-            print("Error: Specified binary does not exist: %s" % opts.binary)
-            return 2
+        print("Error: Specified binary does not exist: %s" % opts.binary)
+        return 2
 
     stdout = None
     stderr = None
@@ -552,7 +527,7 @@ def main(argv=None):
                 args = opts.rargs[1:-1]
             else:
                 args = opts.rargs[1:]
-                if testcaseidx != None:
+                if testcaseidx is not None:
                     args[testcaseidx] = "TESTFILE"
         else:
             if opts.args:
@@ -576,8 +551,8 @@ def main(argv=None):
                     configuration.addMetadata(metadata)
 
         # If configuring through binary failed, try to manually create ProgramConfiguration from command line arguments
-        if configuration == None:
-            if opts.platform == None or opts.product == None or opts.os == None:
+        if configuration is None:
+            if opts.platform is None or opts.product is None or opts.os is None:
                 print("Error: Must specify/configure at least --platform, --product and --os", file=sys.stderr)
                 return 2
 
@@ -585,7 +560,7 @@ def main(argv=None):
 
 
         if not opts.autosubmit:
-            if opts.stderr == None and opts.crashdata == None:
+            if opts.stderr is None and opts.crashdata is None:
                 print("Error: Must specify at least either --stderr or --crashdata file", file=sys.stderr)
                 return 2
 
@@ -625,7 +600,7 @@ def main(argv=None):
 
     if opts.search:
         (sig, metadata) = collector.search(crashInfo)
-        if sig == None:
+        if sig is None:
             print("No match found")
             return 3
         print(sig)
@@ -677,7 +652,7 @@ def main(argv=None):
         print(retFile)
         return 0
 
-    if opts.getclientid:
+    if opts.get_clientid:
         print(collector.clientId)
         return 0
 

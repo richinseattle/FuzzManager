@@ -5,6 +5,7 @@ from django.core.management.base import NoArgsCommand
 from django.utils import timezone
 import logging
 import signal
+import socket
 import ssl
 import threading
 import time
@@ -213,9 +214,18 @@ class Command(NoArgsCommand):
         # Figure out where to put our instances
         try:
             (region, zone, rejected) = self.get_best_region_zone(config)
-        except (boto.exception.EC2ResponseError, ssl.SSLError) as msg:
+        except (boto.exception.EC2ResponseError, boto.exception.BotoServerError, ssl.SSLError, socket.error) as msg:
             # In case of temporary failures here, we will retry again in the next cycle
             logger.warn("[Pool %d] Failed to aquire spot instance prices: %s." % (pool.id, msg))
+            return
+        except (RuntimeError) as msg:
+            logger.error("[Pool %d] Failed to compile userdata." % pool.id)
+            entry = PoolStatusEntry()
+            entry.type = POOL_STATUS_ENTRY_TYPE['config-error']
+            entry.pool = pool
+            entry.isCritical = True
+            entry.msg = "Configuration error: %s" % msg
+            entry.save()
             return
 
         priceLowEntries = PoolStatusEntry.objects.filter(pool=pool, type=POOL_STATUS_ENTRY_TYPE['price-too-low'])
@@ -306,7 +316,9 @@ class Command(NoArgsCommand):
                 for i in range(0, len(boto_instances)):
                     instances[i].hostname = boto_instances[i].public_dns_name
                     instances[i].ec2_instance_id = boto_instances[i].id
-                    instances[i].status_code = boto_instances[i].state_code
+                    # state_code is a 16-bit value where the high byte is
+                    # an opaque internal value and should be ignored.
+                    instances[i].status_code = boto_instances[i].state_code & 255
                     instances[i].save()
 
                     assert(instances[i].ec2_instance_id != None)
@@ -327,9 +339,12 @@ class Command(NoArgsCommand):
                 # the warning now because we obviously succeeded in starting some instances.
                 PoolStatusEntry.objects.filter(pool=pool, type=POOL_STATUS_ENTRY_TYPE['max-spot-instance-count-exceeded']).delete()
 
+                # The same holds for temporary failures of any sort
+                PoolStatusEntry.objects.filter(pool=pool, type=POOL_STATUS_ENTRY_TYPE['temporary-failure']).delete()
+
                 # Do not delete unclassified errors here for now, so the user can see them.
 
-            except (boto.exception.EC2ResponseError, ssl.SSLError) as msg:
+            except (boto.exception.EC2ResponseError, boto.exception.BotoServerError, ssl.SSLError, socket.error) as msg:
                 if "MaxSpotInstanceCountExceeded" in str(msg):
                     logger.warning("[Pool %d] Maximum instance count exceeded for region %s" % (pool.id, region))
                     if not PoolStatusEntry.objects.filter(pool=pool, type=POOL_STATUS_ENTRY_TYPE['max-spot-instance-count-exceeded']):
@@ -338,6 +353,13 @@ class Command(NoArgsCommand):
                         entry.type = POOL_STATUS_ENTRY_TYPE['max-spot-instance-count-exceeded']
                         entry.msg = "Auto-selected region exceeded its maximum spot instance count."
                         entry.save()
+                elif "Service Unavailable" in str(msg):
+                    logger.warning("[Pool %d] Temporary failure in region %s: %s" % (pool.id, region, msg))
+                    entry = PoolStatusEntry()
+                    entry.pool = pool
+                    entry.type = POOL_STATUS_ENTRY_TYPE['temporary-failure']
+                    entry.msg = "Temporary failure occurred: %s" % msg
+                    entry.save()
                 else:
                     logger.exception("[Pool %d] %s: boto failure: %s" % (pool.id, "start_instances_async", msg))
                     entry = PoolStatusEntry()
@@ -385,16 +407,19 @@ class Command(NoArgsCommand):
 
                     # Data consistency checks
                     for boto_instance in boto_instances:
+                        # state_code is a 16-bit value where the high byte is
+                        # an opaque internal value and should be ignored.
+                        state_code = boto_instance.state_code & 255
                         if not ((boto_instance.id in instance_ids_by_region[region])
-                                or (boto_instance.state_code == INSTANCE_STATE['shutting-down']
-                                or boto_instance.state_code == INSTANCE_STATE['terminated'])):
-                            logger.error("[Pool %d] Instance with EC2 ID %s (status %d) is not in region list for region %s" % (pool.id, boto_instance.id, boto_instance.state_code, region))
+                                or (state_code == INSTANCE_STATE['shutting-down']
+                                or state_code == INSTANCE_STATE['terminated'])):
+                            logger.error("[Pool %d] Instance with EC2 ID %s (status %d) is not in region list for region %s" % (pool.id, boto_instance.id, state_code, region))
 
                     cluster.terminate(boto_instances)
                 else:
                     logger.info("[Pool %d] Terminating %s instances in region %s" % (pool.id, len(instance_ids_by_region[region]), region))
                     cluster.terminate(cluster.find(instance_ids=instance_ids_by_region[region]))
-            except (boto.exception.EC2ResponseError, ssl.SSLError) as msg:
+            except (boto.exception.EC2ResponseError, boto.exception.BotoServerError, ssl.SSLError, socket.error) as msg:
                 logger.exception("[Pool %d] %s: boto failure: %s" % (pool.id, "terminate_pool_instances", msg))
                 return 1
 
@@ -421,6 +446,11 @@ class Command(NoArgsCommand):
         instances_by_ids = self.get_instances_by_ids(instances)
         instances_left = []
 
+        debug_boto_instance_ids_seen = set()
+        debug_not_updatable_continue = set()
+        debug_not_in_region = {}
+
+
         for instance_id in instances_by_ids:
             if instance_id:
                 instances_left.append(instances_by_ids[instance_id])
@@ -445,13 +475,22 @@ class Command(NoArgsCommand):
                 boto_instances = cluster.find(filters={"tag:SpotManager-PoolId" : str(pool.pk)})
 
                 for boto_instance in boto_instances:
-                    if not ("SpotManager-Updatable" in boto_instance.tags and int(boto_instance.tags["SpotManager-Updatable"]) > 0):
+                    # Store ID seen for debugging purposes
+                    debug_boto_instance_ids_seen.add(boto_instance.id)
+
+                    # state_code is a 16-bit value where the high byte is
+                    # an opaque internal value and should be ignored.
+                    state_code = boto_instance.state_code & 255
+
+                    if "SpotManager-Updatable" not in boto_instance.tags or int(boto_instance.tags["SpotManager-Updatable"]) <= 0:
                         # The instance is not marked as updatable. We must not touch it because
                         # a spawning thread is still managing this instance. However, we must also
                         # remove this instance from the instances_left list if it's already in our
                         # database, because otherwise our code here would delete it from the database.
                         if boto_instance.id in instance_ids_by_region[region]:
                             instances_left.remove(instances_by_ids[boto_instance.id])
+                        else:
+                            debug_not_updatable_continue.add(boto_instance.id)
                         continue
 
                     instance = None
@@ -460,8 +499,8 @@ class Command(NoArgsCommand):
                     # make sure it's a terminated instance because we should never have a running
                     # instance that matches the search above but is not in our database.
                     if not boto_instance.id in instance_ids_by_region[region]:
-                        if not ((boto_instance.state_code == INSTANCE_STATE['shutting-down']
-                            or boto_instance.state_code == INSTANCE_STATE['terminated'])):
+                        if not ((state_code == INSTANCE_STATE['shutting-down']
+                            or state_code == INSTANCE_STATE['terminated'])):
 
                             # As a last resort, try to find the instance in our database.
                             # If the instance was saved to our database between the entrance
@@ -471,21 +510,21 @@ class Command(NoArgsCommand):
                             q = Instance.objects.filter(ec2_instance_id=boto_instance.id)
                             if q:
                                 instance = q[0]
+                                logger.error("[Pool %d] Instance with EC2 ID %s was reloaded from database." % (pool.id, boto_instance.id))
                             else:
                                 logger.error("[Pool %d] Instance with EC2 ID %s is not in our database." % (pool.id, boto_instance.id))
 
                                 # Terminate at this point, we run in an inconsistent state
                                 assert(False)
-
+                        debug_not_in_region[boto_instance.id] = state_code
                         continue
 
-                    if not instance:
-                        instance = instances_by_ids[boto_instance.id]
-                        instances_left.remove(instance)
+                    instance = instances_by_ids[boto_instance.id]
+                    instances_left.remove(instance)
 
                     # Check the status code and update if necessary
-                    if instance.status_code != boto_instance.state_code:
-                        instance.status_code = boto_instance.state_code
+                    if instance.status_code != state_code:
+                        instance.status_code = state_code
                         instance.save()
 
                     # If for some reason we don't have a hostname yet,
@@ -494,12 +533,21 @@ class Command(NoArgsCommand):
                         instance.hostname = boto_instance.public_dns_name
                         instance.save()
 
-            except (boto.exception.EC2ResponseError, ssl.SSLError) as msg:
+            except (boto.exception.EC2ResponseError, boto.exception.BotoServerError, ssl.SSLError, socket.error) as msg:
                 logger.exception("%s: boto failure: %s" % ("update_pool_instances", msg))
                 return 1
 
         if instances_left:
             for instance in instances_left:
-                logger.info("[Pool %d] Deleting instance with EC2 ID %s from our database, has no corresponding machine on EC2." % (pool.id, instance.ec2_instance_id))
+                if not instance.ec2_instance_id in debug_boto_instance_ids_seen:
+                    logger.info("[Pool %d] Deleting instance with EC2 ID %s from our database, has no corresponding machine on EC2." % (pool.id, instance.ec2_instance_id))
+
+                if instance.ec2_instance_id in debug_not_updatable_continue:
+                    logger.error("[Pool %d] Deleting instance with EC2 ID %s from our database because it is not updatable but not in our region." % (pool.id, instance.ec2_instance_id))
+
+                if instance.ec2_instance_id in debug_not_in_region:
+                    logger.info("[Pool %d] Deleting instance with EC2 ID %s from our database, has state code %s on EC2" % (pool.id, instance.ec2_instance_id, debug_not_in_region[instance.ec2_instance_id]))
+
+                logger.info("[Pool %d] Deleting instance with EC2 ID %s from our database." % (pool.id, instance.ec2_instance_id))
                 instance.delete()
 
